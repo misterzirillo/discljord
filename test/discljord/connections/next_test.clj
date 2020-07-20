@@ -174,24 +174,68 @@
       )))
 
 
-(defn execute-lifecycle-until [stage state until-fn]
-  (a/<!!
-    (a/go-loop [[stage state] [stage state]]
-      (let [s (a/<! (gateway-lifecycle stage state))]
-        (if (until-fn s)
-          s
-          (recur s))))))
+(defn execute-until [state until-fn]
+  (let [execution (a/go-loop [state state]
+                    (if (until-fn state)
+                      state
+                      (recur (a/<! (gateway-lifecycle state)))))]
+    (a/<!!
+      (a/go
+        (a/alt!
+          execution ([x] x)
+          (a/timeout 1000) (throw (Exception. "timeout reached")))))))
 
-(defn until-stage [target-stage [stage _ :as s]]
-  (when-not (= target-stage stage)
-    s))
+(defn until-lifecycle [target-lifecycle {::d.c.n/keys [lifecycle] :as state}]
+  (when (= target-lifecycle lifecycle)
+    state))
 
-(deftest GateWayLifecycleWhole
+(defmacro with-socket-responses [responses & body]
+  `(with-redefs [ws/get-websocket (fn [_#]
+                                    (reify Websocket
+                                      (close [_])
+                                      (send-msg [_ _])
+                                      (recv-msgs [_ ch#]
+                                        (a/onto-chan! ch# ~responses false))))]
+     ~@body))
+
+(deftest GatewayLifecycleWhole
 
   (binding [log/*logger-factory* logi/disabled-logger-factory]
     (with-redefs [d.c.n/retry-delay-ms 0
                   d.c.n/timeout-ms     100]
 
-      (testing "reaches connected state"
-        (let [state (-> (base-state))]))
+      (testing "disconnected reaches connected state"
+        (with-socket-responses [ws-hello-response ws-ready-response]
+          (let [target ::d.c.n/lifecycle.connected
+                state  (-> (base-state)
+                           (execute-until (partial until-lifecycle target)))]
+            (is (= target
+                   (::d.c.n/lifecycle state))))))
+
+      (testing "disconnected reaches connected state with dispatches"
+        (with-socket-responses (concat [ws-hello-response ws-ready-response]
+                                       (repeat 100 ws-dispatch-response))
+          (let [target ::d.c.n/lifecycle.connected
+                state  (-> (base-state)
+                           (execute-until (partial until-lifecycle target)))]
+            (is (= target
+                   (::d.c.n/lifecycle state))))))
+
+      (testing "connection, disconnection, then resume"
+        (with-socket-responses [ws-hello-response ws-ready-response ws-reconnect-response
+                                ws-hello-response ws-ready-response]
+          (let [target ::d.c.n/lifecycle.resuming
+                state  (-> (base-state)
+                           (execute-until (partial until-lifecycle target)))]
+            (is (= target
+                   (::d.c.n/lifecycle state))))))
+
+      (testing "connection, invalidation, then resume"
+        (with-socket-responses [ws-hello-response ws-ready-response ws-invalid-session-response
+                                ws-hello-response ws-ready-response]
+          (let [target ::d.c.n/lifecycle.resuming
+                state  (-> (base-state)
+                           (execute-until (partial until-lifecycle target)))]
+            (is (= target
+                   (::d.c.n/lifecycle state))))))
       )))

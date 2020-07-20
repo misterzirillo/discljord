@@ -50,11 +50,11 @@
   (a/go
     ;; attempt to connect
     (try
-      (log/trace "Attempting websocket connection...")
+      (log/info "Attempting websocket connection...")
       (let [websocket (d.c.ws/get-websocket wss-url)
             ws-chan   (a/chan (a/sliding-buffer 10))]
         (d.c.ws/recv-msgs websocket ws-chan)
-        (log/trace "Websocket connected")
+        (log/info "Websocket connected")
         ;; transport is connected - transition to connecting
         (-> state
             (assoc ::ws-chan ws-chan)
@@ -69,12 +69,12 @@
   [{::keys [ws-chan]
     :as    state}]
   (a/go
-    (log/trace "Awaiting remote hello...")
+    (log/info "Awaiting remote hello...")
     (let [hello              (a/<! (take-next-or-timeout ws-chan))
           heartbeat-interval (get-in hello [:d :heartbeat-interval])]
       (if heartbeat-interval
         (do
-          (log/trace "Hello received")
+          (log/info "Hello received")
           ;; TODO begin heartbeat
           ;; hello is good - transition to identifying
           (-> state
@@ -88,14 +88,13 @@
   [{::keys [websocket ws-chan]
     :as    state}]
   (a/go
-    (log/trace "Requesting identify")
     (d.c.ws/send-msg websocket :TODO-payload-here)
-    (log/trace "Identify requested. Awaiting remote ready...")
+    (log/info "Identify requested. Awaiting remote ready...")
     (let [ready (a/<! (take-next-or-timeout ws-chan))
           {:keys [session-id]} (:d ready)]
       (if session-id
         (do
-          (log/trace "Ready received" ready)
+          (log/info "Ready received" ready)
           (-> state
               (assoc ::session-id session-id)
               (assoc ::lifecycle ::lifecycle.connected)))
@@ -126,7 +125,7 @@
   [{::keys [websocket resume-session-id]
       :as    state}]
   (a/go
-    (log/trace (str "Requesting resume of session id " resume-session-id))
+    (log/info (str "Requesting resume of session id " resume-session-id))
     (d.c.ws/send-msg websocket ::TODO-resume-payload)
     (-> state
         (dissoc ::resume-session-id)
