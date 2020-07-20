@@ -28,9 +28,8 @@
       (is (received? mock-websocket ws/close)))))
 
 ;; TEST DATA
-(def heartbeat-interval 1000)
-(def ws-heartbeat-response
-  {:d {:heartbeat-interval heartbeat-interval}})
+(def ws-hello-response
+  {:d {:heartbeat-interval 1000}})
 
 (def ws-ready-response
   {:d {:session-id 1000}})
@@ -48,41 +47,13 @@
    :d  {}})
 
 (defn base-state []
-  {::d.c.n/websocket (mock-websocket)})
+  {::d.c.n/websocket (mock-websocket)
+   ::d.c.n/ws-chan (a/chan 100)
+   ::d.c.n/output-chan (a/chan 100)})
 
-(defn with-heartbeat-response [state]
-  (let [ws-chan (a/chan)]
-    (a/onto-chan! ws-chan [ws-heartbeat-response] false)
-    (assoc state ::d.c.n/ws-chan ws-chan)))
-
-(defn with-no-response [state]
-  (let [ws-chan (a/chan)]
-    (assoc state ::d.c.n/ws-chan ws-chan)))
-
-(defn with-ready-response [state]
-  (let [ws-chan (a/chan)]
-    (a/onto-chan! ws-chan [ws-ready-response] false)
-    (assoc state ::d.c.n/ws-chan ws-chan)))
-
-(defn with-dispatch-response [state]
-  (let [ws-chan (a/chan)]
-    (a/onto-chan! ws-chan [ws-dispatch-response] false)
-    (assoc state ::d.c.n/ws-chan ws-chan)))
-
-(defn with-invalid-session-response [state]
-  (let [ws-chan (a/chan)]
-    (a/onto-chan! ws-chan [ws-invalid-session-response] false)
-    (assoc state ::d.c.n/ws-chan ws-chan)))
-
-(defn with-reconnect-response [state]
-  (let [ws-chan (a/chan)]
-    (a/onto-chan! ws-chan [ws-reconnect-response] false)
-    (assoc state ::d.c.n/ws-chan ws-chan)))
-
-(defn with-output-chan [state close?]
-  (let [chan (a/chan 2)]
-    (when close? (a/close! chan))
-    (assoc state ::d.c.n/output-chan chan)))
+(defn with-responses [{::d.c.n/keys [ws-chan] :as state} & responses]
+  (a/onto-chan! ws-chan responses)
+  state)
 
 (defn with-resume-session-id [state]
   (assoc state ::d.c.n/resume-session-id 123123))
@@ -108,62 +79,62 @@
                      (gateway-lifecycle ::d.c.n/disconnected {})))))))
 
       (testing "connecting: receives hello -> identifying state"
-        (let [state (-> (base-state) with-heartbeat-response)]
+        (let [state (-> (base-state) (with-responses ws-hello-response))]
           (is (= ::d.c.n/identifying
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/connecting state)))))))
 
       (testing "connecting: timeout -> disconnected state"
-        (let [state (-> (base-state) with-no-response)]
+        (let [state (base-state)]
           (is (= ::d.c.n/disconnected
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/connecting state)))))))
 
       (testing "identifying: receives ready -> connected state"
-        (let [state (-> (base-state) with-ready-response)]
+        (let [state (-> (base-state) (with-responses ws-ready-response))]
           (is (= ::d.c.n/connected
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/identifying state)))))))
 
       (testing "identifying: timeout -> disconnected state"
-        (let [state (-> (base-state) with-no-response)]
+        (let [state (base-state)]
           (is (= ::d.c.n/disconnected
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/identifying state)))))))
 
       (testing "identifying: calls websocket/send-msg"
-        (let [state     (-> (base-state) with-ready-response)
+        (let [state     (-> (base-state) (with-responses ws-ready-response))
               websocket (::d.c.n/websocket state)]
           (a/<!! (gateway-lifecycle ::d.c.n/identifying state))
           (is (received? websocket ws/send-msg))))
 
       (testing "connected: receives event dispatch -> connected state"
-        (let [state (-> (base-state) with-dispatch-response (with-output-chan true))]
+        (let [state (-> (base-state) (with-responses ws-dispatch-response))]
           (is (= ::d.c.n/connected
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/connected state)))))))
 
       (testing "connected: receives invalid session -> disconnected state"
-        (let [state (-> (base-state) with-invalid-session-response)]
+        (let [state (-> (base-state) (with-responses ws-invalid-session-response))]
           (is (= ::d.c.n/disconnected
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/connected state)))))))
 
       (testing "connected: receives reconnect -> disconnected state"
-        (let [state (-> (base-state) with-reconnect-response)]
+        (let [state (-> (base-state) (with-responses ws-reconnect-response))]
           (is (= ::d.c.n/disconnected
                  (first
                    (a/<!!
                      (gateway-lifecycle ::d.c.n/connected state)))))))
 
       (testing "connected: outputs event dispatch"
-        (let [state  (-> (base-state) with-dispatch-response (with-output-chan false))
+        (let [state  (-> (base-state) (with-responses ws-dispatch-response))
               output (::d.c.n/output-chan state)]
           (a/<!! (gateway-lifecycle ::d.c.n/connected state))
           (is (= (:d ws-dispatch-response)
