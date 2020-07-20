@@ -37,11 +37,8 @@
   "A multimethod defining the different states of a Discord gateway connection in
   accordance with the docs at https://discord.com/developers/docs/topics/gateway#connecting-to-the-gateway.
 
-  Each method describes a stage of the lifecycle and returns a channel that will receive a
-  vector [next-stage next-state] to be used to reach the next stage of the lifecycle by calling
-  `(gateway-lifecycle next-stage next-state)`. Conceptually this model is a state machine.
-
-  To maintain the connection an external runner should execute gateway-lifecycle methods consecutively in a loop."
+  Each method of the lifecycle returns a channel that receives the next state to be executed.
+  To maintain the connection an external runner should execute gateway-lifecycle consecutively in a go-loop."
   ::lifecycle)
 
 (defmethod gateway-lifecycle ::lifecycle.disconnected
