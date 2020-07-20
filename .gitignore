@@ -18,3 +18,7 @@ pom.xml.asc
 log/
 dev/
 .dir-locals.el
+
+.idea/
+
+*.iml
