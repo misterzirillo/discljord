@@ -84,6 +84,9 @@
     (when close? (a/close! chan))
     (assoc state ::d.c.n/output-chan chan)))
 
+(defn with-resume-session-id [state]
+  (assoc state ::d.c.n/resume-session-id 123123))
+
 (deftest GatewayLifecycleStages
 
   (binding [log/*logger-factory* logi/disabled-logger-factory]
@@ -165,4 +168,24 @@
           (a/<!! (gateway-lifecycle ::d.c.n/connected state))
           (is (= (:d ws-dispatch-response)
                  (a/<!! output)))))
+
+      (testing "connected: has resume state id -> resuming state"
+        (let [state (-> (base-state) with-resume-session-id)]
+          (is (= ::d.c.n/resuming
+                 (first
+                   (a/<!!
+                     (gateway-lifecycle ::d.c.n/connected state)))))))
+
+      (testing "resuming: -> connected state"
+        (let [state (-> (base-state) with-resume-session-id)]
+          (is (= ::d.c.n/connected
+                 (first
+                   (a/<!!
+                     (gateway-lifecycle ::d.c.n/resuming state)))))))
+
+      (testing "resuming: calls websocket/send-msg"
+        (let [state     (base-state)
+              websocket (::d.c.n/websocket state)]
+          (a/<!! (gateway-lifecycle ::d.c.n/resuming state))
+          (is (received? websocket ws/send-msg))))
       )))
