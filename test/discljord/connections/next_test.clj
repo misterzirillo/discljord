@@ -7,32 +7,28 @@
             [discljord.connections.next :as d.c.n :refer [gateway-lifecycle]]
             [shrubbery.core :refer :all]))
 
-(defn mock-websocket [] (mock Websocket {:send-msg :ok}))
-
-(deftest MockWebsocket
-
-  (testing "mock websocket"
-
-    ;; mostly this is just me figuring out how to use shrubbery
-    ;; testing this namespace will rely somewhat on knowing the websocket protocol is being used correctly
-
-    (let [mock-websocket (mock-websocket)]
-      ;; do the calls
-      (ws/send-msg mock-websocket nil)
-      (ws/recv-msgs mock-websocket nil)
-      (ws/close mock-websocket)
-
-      ;; check the things
-      (is (received? mock-websocket ws/send-msg))
-      (is (received? mock-websocket ws/recv-msgs))
-      (is (received? mock-websocket ws/close)))))
+(defn mock-websocket
+  ([] (mock-websocket {}))
+  ([opcodes->responses]
+   (spy
+     (reify Websocket
+       (close [_])
+       (send-msg [_ _])
+       (subscribe-opcodes [_ opcodes ch]
+         (when-let [responses (and opcodes ch
+                                   (get opcodes->responses opcodes))]
+           (if (coll? responses)
+             (a/onto-chan! ch responses)
+             (a/pipe responses ch))))))))
 
 ;; TEST DATA
 (def ws-hello-response
-  {:d {:heartbeat-interval 1000}})
+  {:op :hello
+   :d  {:heartbeat-interval 1000}})
 
 (def ws-ready-response
-  {:d {:session-id 1000}})
+  {:op :ready
+   :d  {:session-id 1000}})
 
 (def ws-dispatch-response
   {:op :event-dispatch                                      ; TODO opcode
@@ -46,22 +42,30 @@
   {:op :reconnect                                           ; TODO opcode
    :d  {}})
 
+(def ws-heartbeat-request
+  {:op :heartbeat                                           ; TODO opcode
+   :d  {}})
+
+(def ws-heartbeat-ack
+  {:op :heartbeat-ack                                       ; TODO opcode
+   :d  {}})
+
 (defn base-state
   ([] (base-state ::d.c.n/lifecycle.disconnected))
   ([lifecycle]
-   {::d.c.n/websocket   (mock-websocket)
-    ::d.c.n/ws-chan     (a/chan 100)
-    ::d.c.n/output-chan (a/chan 100)
-    ::d.c.n/lifecycle   lifecycle}))
+   {::d.c.n/websocket  (mock-websocket)
+    ::d.c.n/control-ch (a/chan 100)
+    ::d.c.n/output-ch  (a/chan 100)
+    ::d.c.n/lifecycle  lifecycle}))
 
-(defn with-responses [{::d.c.n/keys [ws-chan] :as state} & responses]
-  (a/onto-chan! ws-chan responses)
+(defn with-control-responses [{::d.c.n/keys [control-ch] :as state} & responses]
+  (a/onto-chan! control-ch responses)
   state)
 
 (defn with-resume-session-id [state]
   (assoc state ::d.c.n/resume-session-id 123123))
 
-(deftest GatewayLifecycleStages
+(deftest GatewayLifecycleTransitions
 
   (binding [log/*logger-factory* logi/disabled-logger-factory]
     (with-redefs [d.c.n/retry-delay-ms 0
@@ -83,7 +87,7 @@
 
       (testing "connecting: receives hello -> identifying state"
         (let [state (-> (base-state ::d.c.n/lifecycle.connecting)
-                        (with-responses ws-hello-response))]
+                        (with-control-responses ws-hello-response))]
           (is (= ::d.c.n/lifecycle.identifying
                  (::d.c.n/lifecycle
                    (a/<!!
@@ -98,7 +102,7 @@
 
       (testing "identifying: receives ready -> connected state"
         (let [state (-> (base-state ::d.c.n/lifecycle.identifying)
-                        (with-responses ws-ready-response))]
+                        (with-control-responses ws-ready-response))]
           (is (= ::d.c.n/lifecycle.connected
                  (::d.c.n/lifecycle
                    (a/<!!
@@ -113,22 +117,14 @@
 
       (testing "identifying: calls websocket/send-msg"
         (let [state     (-> (base-state ::d.c.n/lifecycle.identifying)
-                            (with-responses ws-ready-response))
+                            (with-control-responses ws-ready-response))
               websocket (::d.c.n/websocket state)]
           (a/<!! (gateway-lifecycle state))
           (is (received? websocket ws/send-msg))))
 
-      (testing "connected: receives event dispatch -> connected state"
-        (let [state (-> (base-state ::d.c.n/lifecycle.connected)
-                        (with-responses ws-dispatch-response))]
-          (is (= ::d.c.n/lifecycle.connected
-                 (::d.c.n/lifecycle
-                   (a/<!!
-                     (gateway-lifecycle state)))))))
-
       (testing "connected: receives invalid session -> disconnected state"
         (let [state (-> (base-state ::d.c.n/lifecycle.connected)
-                        (with-responses ws-invalid-session-response))]
+                        (with-control-responses ws-invalid-session-response))]
           (is (= ::d.c.n/lifecycle.disconnected
                  (::d.c.n/lifecycle
                    (a/<!!
@@ -136,66 +132,35 @@
 
       (testing "connected: receives reconnect -> disconnected state"
         (let [state (-> (base-state ::d.c.n/lifecycle.connected)
-                        (with-responses ws-reconnect-response))]
+                        (with-control-responses ws-reconnect-response))]
           (is (= ::d.c.n/lifecycle.disconnected
                  (::d.c.n/lifecycle
                    (a/<!!
                      (gateway-lifecycle state)))))))
 
-      (testing "connected: outputs event dispatch"
-        (let [state  (-> (base-state ::d.c.n/lifecycle.connected)
-                         (with-responses ws-dispatch-response))
-              output (::d.c.n/output-chan state)]
-          (a/<!! (gateway-lifecycle state))
-          (is (= (:d ws-dispatch-response)
-                 (a/<!! output)))))
-
-      (testing "connected: has resume state id -> resuming state"
-        (let [state (-> (base-state ::d.c.n/lifecycle.connected)
-                        with-resume-session-id)]
-          (is (= ::d.c.n/lifecycle.resuming
-                 (::d.c.n/lifecycle
-                   (a/<!!
-                     (gateway-lifecycle state)))))))
-
-      (testing "resuming: -> connected state"
-        (let [state (-> (base-state ::d.c.n/lifecycle.resuming)
-                        with-resume-session-id)]
-          (is (= ::d.c.n/lifecycle.connected
-                 (::d.c.n/lifecycle
-                   (a/<!!
-                     (gateway-lifecycle state)))))))
-
-      (testing "resuming: calls websocket/send-msg"
-        (let [state     (base-state ::d.c.n/lifecycle.resuming)
+      (testing "identifying: resumable, calls websocket/send-msg"
+        (let [state     (-> (base-state ::d.c.n/lifecycle.identifying) with-resume-session-id)
               websocket (::d.c.n/websocket state)]
           (a/<!! (gateway-lifecycle state))
           (is (received? websocket ws/send-msg))))
       )))
 
-
-(defn execute-until [state until-fn]
-  (let [execution (a/go-loop [state state]
-                    (if (until-fn state)
-                      state
-                      (recur (a/<! (gateway-lifecycle state)))))]
+(defn n-executions [state n]
+  (let [timeout (a/timeout 1000)]
     (a/<!!
-      (a/go
-        (a/alt!
-          execution ([x] x)
-          (a/timeout 1000) (throw (Exception. "timeout reached")))))))
+      (a/go-loop [nn 0
+                  state state]
+        (if (< nn n)
+          (recur (inc nn)
+                 (a/alt!
+                   (gateway-lifecycle state) ([s] s)
+                   timeout (throw (Exception. "Test timed out"))
+                   :priority true))
+          state)))))
 
-(defn until-lifecycle [target-lifecycle {::d.c.n/keys [lifecycle] :as state}]
-  (when (= target-lifecycle lifecycle)
-    state))
 
 (defmacro with-socket-responses [responses & body]
-  `(with-redefs [ws/get-websocket (fn [_#]
-                                    (reify Websocket
-                                      (close [_])
-                                      (send-msg [_ _])
-                                      (recv-msgs [_ ch#]
-                                        (a/onto-chan! ch# ~responses false))))]
+  `(with-redefs [ws/get-websocket (fn [_#] (mock-websocket ~responses))]
      ~@body))
 
 (deftest GatewayLifecycleWhole
@@ -204,38 +169,69 @@
     (with-redefs [d.c.n/retry-delay-ms 0
                   d.c.n/timeout-ms     100]
 
-      (testing "disconnected reaches connected state"
-        (with-socket-responses [ws-hello-response ws-ready-response]
-          (let [target ::d.c.n/lifecycle.connected
-                state  (-> (base-state)
-                           (execute-until (partial until-lifecycle target)))]
-            (is (= target
-                   (::d.c.n/lifecycle state))))))
+      (testing "normal startup"
+        (with-socket-responses {d.c.n/control-opcodes [ws-hello-response ws-ready-response]}
+          (let [state (-> (base-state)
+                          (n-executions 3))]
+            (is (= ::d.c.n/lifecycle.connected (::d.c.n/lifecycle state))
+                "Connected state is reached"))))
 
-      (testing "disconnected reaches connected state with dispatches"
-        (with-socket-responses (concat [ws-hello-response ws-ready-response]
-                                       (repeat 100 ws-dispatch-response))
-          (let [target ::d.c.n/lifecycle.connected
-                state  (-> (base-state)
-                           (execute-until (partial until-lifecycle target)))]
-            (is (= target
-                   (::d.c.n/lifecycle state))))))
+      (testing "reconnect request"
+        (with-socket-responses {d.c.n/control-opcodes [ws-hello-response ws-ready-response
+                                                       ws-reconnect-response ws-hello-response
+                                                       ws-ready-response]}
+          (let [state     (-> (base-state)
+                              (n-executions 7))
+                websocket (::d.c.n/websocket state)]
+            (is (= ::d.c.n/lifecycle.connected (::d.c.n/lifecycle state))
+                "Connected state is reached again")
+            (is (received? websocket ws/send-msg [::d.c.n/TODO-resume-payload])
+                "A request to resume the previous session is sent"))))
 
-      (testing "connection, disconnection, then resume"
-        (with-socket-responses [ws-hello-response ws-ready-response ws-reconnect-response
-                                ws-hello-response ws-ready-response]
-          (let [target ::d.c.n/lifecycle.resuming
-                state  (-> (base-state)
-                           (execute-until (partial until-lifecycle target)))]
-            (is (= target
-                   (::d.c.n/lifecycle state))))))
-
-      (testing "connection, invalidation, then resume"
-        (with-socket-responses [ws-hello-response ws-ready-response ws-invalid-session-response
-                                ws-hello-response ws-ready-response]
-          (let [target ::d.c.n/lifecycle.resuming
-                state  (-> (base-state)
-                           (execute-until (partial until-lifecycle target)))]
-            (is (= target
-                   (::d.c.n/lifecycle state))))))
+      (testing "session invalidation"
+        (with-socket-responses {d.c.n/control-opcodes [ws-hello-response ws-ready-response
+                                                       ws-invalid-session-response ws-hello-response
+                                                       ws-ready-response]}
+          (let [state     (-> (base-state)
+                              (n-executions 7))
+                websocket (::d.c.n/websocket state)]
+            (is (= ::d.c.n/lifecycle.connected (::d.c.n/lifecycle state))
+                "Connected state is reached again")
+            (is (received? websocket ws/send-msg [::d.c.n/TODO-resume-payload])
+                "A request to resume the previous session is sent"))))
       )))
+
+(defn deliver-interval [interval items]
+  (let [ch (a/chan 2)]
+    (a/go-loop [[it & itt] items]
+      (when it
+        (a/>! ch it)
+        (a/<! (a/timeout interval))
+        (recur itt)))
+    ch))
+
+(deftest HeartbeatRoutine
+  (binding [log/*logger-factory* logi/disabled-logger-factory]
+    (testing "heartbeat manual halt"
+      (let [halt-ch (a/chan)
+            ch      (d.c.n/begin-periodic-heartbeat (mock-websocket) 1000 halt-ch)]
+        (a/close! halt-ch)
+        (is (nil? (a/<!! ch)))))
+
+    (testing "closes after interval"
+      (let [ch (d.c.n/begin-periodic-heartbeat (mock-websocket) 10 (a/timeout 10000))]
+        (is (nil? (a/<!! ch)))))
+
+    (testing "sends requested heartbeat"
+      (let [halt-ch   (a/timeout 100)
+            websocket (mock-websocket {d.c.n/heartbeat-opcodes [ws-heartbeat-request]})]
+        (a/<!! (d.c.n/begin-periodic-heartbeat websocket 1000 halt-ch))
+        (is (= 2 (call-count websocket ws/send-msg)))))
+
+    (testing "sends periodic heartbeats"
+      (let [halt-ch   (a/timeout 100)
+            websocket (mock-websocket {d.c.n/heartbeat-opcodes (deliver-interval
+                                                                 10 (repeat 10 ws-heartbeat-ack))})]
+        (a/<!! (d.c.n/begin-periodic-heartbeat websocket 10 halt-ch))
+        (is (= 10 (call-count websocket ws/send-msg)))))
+    ))

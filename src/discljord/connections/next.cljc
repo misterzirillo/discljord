@@ -1,44 +1,53 @@
 (ns discljord.connections.next
   (:require
     [discljord.connections.websocket :as d.c.ws]
+    [discljord.connections.util :refer [dupes]]
     [clojure.core.async :as a]
     [clojure.tools.logging :as log]))
 
-(def retry-delay-ms 5000)
+(def retry-delay-ms 5000)                                   ; per the rate limiting docs
 (def timeout-ms 10000)
 
-(defn- take-next-or-timeout
-  "Attempts to take a value from the applied channel within `timeout-ms`, otherwise
-  returns `::timeout`"
-  [ch]
-  (let [timeout (a/timeout timeout-ms)]
-    (a/go
-      (a/alt!
-        timeout ::timeout
-        ch ([x] x)))))
+(def heartbeat-opcodes #{1 11})
+(def control-opcodes #{7 9 10})
+(def dispatch-opcodes #{1})
+
+(defn- with-timeout
+  ([ch] (with-timeout (a/timeout timeout-ms) ch))
+  ([timeout ch]
+   (a/go
+     (a/alt!
+       ch ([x] x)
+       timeout nil
+       :priority true))))
+
+(defn- with-halt
+  [halt-ch other-ch]
+  (a/go
+    (a/alt!
+      halt-ch nil
+      other-ch ([x] x)
+      :priority true)))
 
 (defn- transition-disconnected
-  "Transforms the given state to a disconnected one, returning a vector containing the new
-  state and the disconnected stage keyword. Can be used to create a new initial state."
-  [{::keys [ws-chan websocket connection-attempts session-id]
+  [{::keys [websocket connection-attempts session-id control-ch]
     :or    {connection-attempts 0}
     :as    state}]
   (when websocket (d.c.ws/close websocket))
-  (when ws-chan (a/close! ws-chan))
+  (when control-ch (a/close! control-ch))
   (-> state
-      (dissoc ::ws-chan)
-      (dissoc ::websocket)
-      (dissoc ::session-id)
+      (dissoc ::websocket ::session-id)
       (assoc ::connection-attempts (inc connection-attempts))
       (assoc ::resume-session-id session-id)
       (assoc ::lifecycle ::lifecycle.disconnected)))
 
 (defmulti gateway-lifecycle
-  "A multimethod defining the different states of a Discord gateway connection in
-  accordance with the docs at https://discord.com/developers/docs/topics/gateway#connecting-to-the-gateway.
+  "A multimethod defining the different states of a Discord gateway connection
+   in accordance with the docs at https://discord.com/developers/docs/topics/gateway#connecting-to-the-gateway.
 
-  Each method of the lifecycle returns a channel that receives the next state to be executed.
-  To maintain the connection an external runner should execute gateway-lifecycle consecutively in a go-loop."
+  Each method of the lifecycle returns a channel that receives the next state
+  to be executed. To maintain the connection an external runner should execute
+  gateway-lifecycle consecutively in a go-loop."
   ::lifecycle)
 
 (defmethod gateway-lifecycle ::lifecycle.disconnected
@@ -48,13 +57,13 @@
     ;; attempt to connect
     (try
       (log/info "Attempting websocket connection...")
-      (let [websocket (d.c.ws/get-websocket wss-url)
-            ws-chan   (a/chan (a/sliding-buffer 10))]
-        (d.c.ws/recv-msgs websocket ws-chan)
+      (let [websocket  (d.c.ws/get-websocket wss-url)
+            control-ch (a/chan 10)]
+        (d.c.ws/subscribe-opcodes websocket control-opcodes control-ch)
         (log/info "Websocket connected")
         ;; transport is connected - transition to connecting
         (-> state
-            (assoc ::ws-chan ws-chan)
+            (assoc ::control-ch control-ch)
             (assoc ::websocket websocket)
             (assoc ::lifecycle ::lifecycle.connecting)))
       (catch #?(:clj Exception :cljs js/Object) e
@@ -63,17 +72,15 @@
         (transition-disconnected state)))))
 
 (defmethod gateway-lifecycle ::lifecycle.connecting
-  [{::keys [ws-chan]
+  [{::keys [control-ch]
     :as    state}]
   (a/go
     (log/info "Awaiting remote hello...")
-    (let [hello              (a/<! (take-next-or-timeout ws-chan))
+    (let [hello              (->> control-ch (with-timeout) (a/<!))
           heartbeat-interval (get-in hello [:d :heartbeat-interval])]
       (if heartbeat-interval
         (do
           (log/info "Hello received")
-          ;; TODO begin heartbeat
-          ;; hello is good - transition to identifying
           (-> state
               (assoc ::heartbeat-interval heartbeat-interval)
               (assoc ::lifecycle ::lifecycle.identifying)))
@@ -82,17 +89,20 @@
           (transition-disconnected state))))))
 
 (defmethod gateway-lifecycle ::lifecycle.identifying
-  [{::keys [websocket ws-chan]
+  [{::keys [websocket control-ch resume-session-id]
     :as    state}]
   (a/go
     (d.c.ws/send-msg websocket :TODO-payload-here)
     (log/info "Identify requested. Awaiting remote ready...")
-    (let [ready (a/<! (take-next-or-timeout ws-chan))
-          {:keys [session-id]} (:d ready)]
+    (let [{{:keys [session-id]} :d} (->> control-ch (with-timeout) (a/<!))]
       (if session-id
         (do
-          (log/info "Ready received" ready)
+          (log/info "Ready received")
+          (when resume-session-id
+            (log/info (str "Requesting resume of session id " resume-session-id))
+            (d.c.ws/send-msg websocket ::TODO-resume-payload))
           (-> state
+              (dissoc ::resume-session-id)
               (assoc ::session-id session-id)
               (assoc ::lifecycle ::lifecycle.connected)))
         (do
@@ -100,30 +110,56 @@
           (transition-disconnected state))))))
 
 (defmethod gateway-lifecycle ::lifecycle.connected
-  [{::keys [ws-chan session-id resume-session-id output-chan]
+  [{::keys [control-ch session-id output-ch websocket]
     :as    state}]
   (a/go
     (log/info (str "Session " session-id " connected"))
-    (if resume-session-id
-      (assoc state ::lifecycle ::lifecycle.resuming)
-      (let [{:keys [op d] :as evt} (a/<! ws-chan)]
-        (case op
-          :event-dispatch (do (a/>! output-chan d)
-                              state)
-          :invalid-session (do (log/info "Session invalidated. Disconnecting...")
-                               (transition-disconnected state))
-          :reconnect (do (log/info "Reconnect signal received. Disconnecting...")
-                         (transition-disconnected state))
-          ;; TODO handle heartbeat and heartbeat ACK
-          (do (log/warn (str "Unknown opcode  " op) evt)
-              state))))))
+    ;; connected - pipe dispatch events to the output channel
+    (let [ch (a/chan 10)]
+      (d.c.ws/subscribe-opcodes websocket dispatch-opcodes ch)
+      ;; an intermediate channel is needed so the output channel remains open
+      ;; if the websocket is closed. Seamless recovery for the consumer
+      (a/pipe ch output-ch false)
+      (let [{:keys [op] :as evt} (a/<! control-ch)]
+        (case (or op evt)
+          :invalid-session (log/info "Session invalidated. Disconnecting...")
+          :reconnect (log/info "Reconnect signal received. Disconnecting...")
+          (log/warn (str "Unknown opcode " op ". Disconnecting...")))
+        (a/close! ch)
+        (transition-disconnected state)))))
 
-(defmethod gateway-lifecycle ::lifecycle.resuming
-  [{::keys [websocket resume-session-id]
-      :as    state}]
-  (a/go
-    (log/info (str "Requesting resume of session id " resume-session-id))
-    (d.c.ws/send-msg websocket ::TODO-resume-payload)
-    (-> state
-        (dissoc ::resume-session-id)
-        (assoc ::lifecycle ::lifecycle.connected))))
+(defn begin-periodic-heartbeat
+  "Begins a process that sends a websocket heartbeat at the specified interval.
+  Returns a channel that closes if a stale connection is detected."
+  [websocket heartbeat-interval halt-ch]
+  (log/info "Beginning heartbeat with interval" heartbeat-interval)
+  (let [heartbeat-in-ch     (a/chan)
+        heartbeat-in-mult   (a/mult heartbeat-in-ch)
+        heartbeat-in-req-ch (a/chan 1 (filter (comp (partial = :heartbeat)
+                                                    :op)))
+        heartbeat-in-ack-ch (a/chan (a/dropping-buffer 1) (filter (comp (partial = :heartbeat-ack)
+                                                                        :op)))]
+
+    (a/tap heartbeat-in-mult heartbeat-in-req-ch)
+    (a/tap heartbeat-in-mult heartbeat-in-ack-ch)
+    (d.c.ws/subscribe-opcodes websocket heartbeat-opcodes heartbeat-in-ch)
+
+    ;; heartbeat request loop
+    (a/go-loop []
+      (when (a/<! (with-halt halt-ch heartbeat-in-req-ch))
+        (d.c.ws/send-msg websocket :heartbeat)
+        (recur)))
+
+    ;; periodic heartbeat loop
+    ;; notice the dropping buffer for the ack channel:
+    ;; this process should ignore multiple acks during the interval
+    (a/go-loop []
+      (d.c.ws/send-msg websocket :heartbeat)
+      (let [timeout (a/timeout heartbeat-interval)
+            {:keys [op]} (->> heartbeat-in-ack-ch
+                              (with-timeout timeout)
+                              (with-halt halt-ch)
+                              (a/<!))]
+        (a/<! timeout)                                      ; wait for timeout regardless
+        (when (= op :heartbeat-ack)
+          (recur))))))
