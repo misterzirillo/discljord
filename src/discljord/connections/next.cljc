@@ -1,16 +1,15 @@
 (ns discljord.connections.next
   (:require
     [discljord.connections.websocket :as d.c.ws]
-    [discljord.connections.util :refer [dupes]]
     [clojure.core.async :as a]
     [clojure.tools.logging :as log]))
 
 (def retry-delay-ms 5000)                                   ; per the rate limiting docs
 (def timeout-ms 10000)
 
-(def heartbeat-opcodes #{1 11})
-(def control-opcodes #{7 9 10})
-(def dispatch-opcodes #{1})
+(def heartbeat-opcodes #{:heartbeat :heartbeat-ack})
+(def control-opcodes #{:hello :ready :reconnect :invalid-session})
+(def dispatch-opcodes #{:event-dispatch})
 
 (defn- with-timeout
   ([ch] (with-timeout (a/timeout timeout-ms) ch))
@@ -33,10 +32,11 @@
   [{::keys [websocket connection-attempts session-id control-ch]
     :or    {connection-attempts 0}
     :as    state}]
-  (when websocket (d.c.ws/close websocket))
+  (when websocket (d.c.ws/disconnect websocket))
   (when control-ch (a/close! control-ch))
+  (log/trace "Disconnecting")
   (-> state
-      (dissoc ::websocket ::session-id)
+      (dissoc ::session-id)
       (assoc ::connection-attempts (inc connection-attempts))
       (assoc ::resume-session-id session-id)
       (assoc ::lifecycle ::lifecycle.disconnected)))
@@ -51,15 +51,14 @@
   ::lifecycle)
 
 (defmethod gateway-lifecycle ::lifecycle.disconnected
-  [{::keys [wss-url connection-attempts]
+  [{::keys [websocket connection-attempts]
     :as    state}]
   (a/go
-    ;; attempt to connect
     (try
       (log/info "Attempting websocket connection...")
-      (let [websocket  (d.c.ws/get-websocket wss-url)
-            control-ch (a/chan 10)]
+      (let [control-ch (a/chan 10)]
         (d.c.ws/subscribe-opcodes websocket control-opcodes control-ch)
+        (d.c.ws/connect websocket)
         (log/info "Websocket connected")
         ;; transport is connected - transition to connecting
         (-> state
@@ -92,7 +91,7 @@
   [{::keys [websocket control-ch resume-session-id]
     :as    state}]
   (a/go
-    (d.c.ws/send-msg websocket :TODO-payload-here)
+    (d.c.ws/send-msg websocket :identify)
     (log/info "Identify requested. Awaiting remote ready...")
     (let [{{:keys [session-id]} :d} (->> control-ch (with-timeout) (a/<!))]
       (if session-id
@@ -100,7 +99,7 @@
           (log/info "Ready received")
           (when resume-session-id
             (log/info (str "Requesting resume of session id " resume-session-id))
-            (d.c.ws/send-msg websocket ::TODO-resume-payload))
+            (d.c.ws/send-msg websocket :resume))
           (-> state
               (dissoc ::resume-session-id)
               (assoc ::session-id session-id)
@@ -110,23 +109,21 @@
           (transition-disconnected state))))))
 
 (defmethod gateway-lifecycle ::lifecycle.connected
-  [{::keys [control-ch session-id output-ch websocket]
+  [{::keys [control-ch session-id output-ch websocket halt-ch]
     :as    state}]
   (a/go
     (log/info (str "Session " session-id " connected"))
     ;; connected - pipe dispatch events to the output channel
+    ;; don't allow the output channel to close
     (let [ch (a/chan 10)]
-      (d.c.ws/subscribe-opcodes websocket dispatch-opcodes ch)
-      ;; an intermediate channel is needed so the output channel remains open
-      ;; if the websocket is closed. Seamless recovery for the consumer
       (a/pipe ch output-ch false)
-      (let [{:keys [op] :as evt} (a/<! control-ch)]
-        (case (or op evt)
-          :invalid-session (log/info "Session invalidated. Disconnecting...")
-          :reconnect (log/info "Reconnect signal received. Disconnecting...")
-          (log/warn (str "Unknown opcode " op ". Disconnecting...")))
-        (a/close! ch)
-        (transition-disconnected state)))))
+      (d.c.ws/subscribe-opcodes websocket dispatch-opcodes ch))
+    (let [{:keys [op] :as evt} (a/<! (with-halt halt-ch control-ch))]
+      (case (or op evt)
+        :invalid-session (log/info "Session invalidated. Disconnecting...")
+        :reconnect (log/info "Reconnect signal received. Disconnecting...")
+        (log/warn (str "Invalid event " evt ". Disconnecting...")))
+      (transition-disconnected state))))
 
 (defn begin-periodic-heartbeat
   "Begins a process that sends a websocket heartbeat at the specified interval.
