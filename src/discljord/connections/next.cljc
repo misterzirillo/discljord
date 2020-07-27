@@ -1,6 +1,7 @@
 (ns discljord.connections.next
   (:require
     [discljord.connections.websocket :as d.c.ws]
+    [discljord.util.async :refer [with-halt]]
     [clojure.core.async :as a]
     [clojure.tools.logging :as log]))
 
@@ -11,22 +12,8 @@
 (def control-opcodes #{:hello :ready :reconnect :invalid-session})
 (def dispatch-opcodes #{:event-dispatch})
 
-(defn- with-timeout
-  ([ch] (with-timeout (a/timeout timeout-ms) ch))
-  ([timeout ch]
-   (a/go
-     (a/alt!
-       ch ([x] x)
-       timeout nil
-       :priority true))))
-
-(defn- with-halt
-  [halt-ch other-ch]
-  (a/go
-    (a/alt!
-      halt-ch nil
-      other-ch ([x] x)
-      :priority true)))
+(defn- with-timeout [ch]
+  (with-halt (a/timeout timeout-ms) ch))
 
 (defn- transition-disconnected
   [{::keys [websocket connection-attempts session-id control-ch]
@@ -65,8 +52,8 @@
             (assoc ::control-ch control-ch)
             (assoc ::websocket websocket)
             (assoc ::lifecycle ::lifecycle.connecting)))
-      (catch #?(:clj Exception :cljs js/Object) e
-        (log/error (str "Failed websocket connection attempt " connection-attempts) e)
+      (catch #?(:clj Exception :cljs js/Object) _e
+        (log/error (str "Failed websocket connection attempt " connection-attempts) _e)
         (a/<! (a/timeout retry-delay-ms))
         (transition-disconnected state)))))
 
@@ -154,7 +141,7 @@
       (d.c.ws/send-msg websocket :heartbeat)
       (let [timeout (a/timeout heartbeat-interval)
             {:keys [op]} (->> heartbeat-in-ack-ch
-                              (with-timeout timeout)
+                              (with-halt timeout)
                               (with-halt halt-ch)
                               (a/<!))]
         (a/<! timeout)                                      ; wait for timeout regardless

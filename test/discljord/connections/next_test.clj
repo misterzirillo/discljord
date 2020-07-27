@@ -51,40 +51,38 @@
              (a/onto-chan! ch responses)
              (a/pipe responses ch))))))))
 
-(defprotocol InjectableSocket
+(defprotocol SimulatedWebsocket
   (inject [ws msg-ch]))
 
-(defn mock-websocket-reactive []
-  (let [all-ch (a/chan 5)
-        pub    (a/pub all-ch :op)
-        connected (atom false)
-        awaiting-connect (atom [])]
+(defn mock-websocket-simulated []
+  (let [pub-ch           (a/chan 5)
+        pub              (a/pub pub-ch :op)
+        connected        (atom false)]
     (spy
       (reify
         Websocket
         (connect [_]
-          (a/put! all-ch ws-hello-response))
+          (a/put! pub-ch ws-hello-response))
         (disconnect [_]
           (reset! connected false))
         (send-msg [_ msg]
           (case msg
-            :heartbeat (a/put! all-ch ws-heartbeat-ack)
-            :identify (do (a/put! all-ch {:op :ready :d {:session-id (rand-int 1000)}})
-                          (reset! connected true)
-                          (doseq [ch @awaiting-connect]
-                            (a/pipe ch all-ch false))
-                          (reset! awaiting-connect []))
+            :heartbeat (a/put! pub-ch ws-heartbeat-ack)
+            :identify (do (a/put! pub-ch {:op :ready :d {:session-id (rand-int 1000)}})
+                          (reset! connected true))
             :noop)
           :ok)
         (subscribe-opcodes [_ opcodes ch]
           (doseq [op opcodes]
             (a/sub pub op ch)))
 
-        InjectableSocket
+        SimulatedWebsocket
         (inject [_ msg-ch]
-          (if @connected
-            (a/pipe msg-ch all-ch false)
-            (swap! awaiting-connect conj msg-ch)))))))
+          (a/go-loop [msg (a/<! msg-ch)]
+            (if (and msg @connected)
+              (do (a/>! pub-ch msg)
+                  (recur (a/<! msg-ch)))
+              (when msg (recur msg)))))))))
 
 (defn base-state
   ([] (base-state ::d.c.n/lifecycle.disconnected))
@@ -105,11 +103,11 @@
 (defn with-resume-session-id [state]
   (assoc state ::d.c.n/resume-session-id 123123))
 
-(defn with-reactive-websocket
+(defn with-simulated-websocket
   ([state]
-   (assoc state ::d.c.n/websocket (mock-websocket-reactive)))
+   (assoc state ::d.c.n/websocket (mock-websocket-simulated)))
   ([state msg-ch]
-   (let [sock (mock-websocket-reactive)]
+   (let [sock (mock-websocket-simulated)]
      (inject sock msg-ch)
      (assoc state ::d.c.n/websocket sock))))
 
@@ -215,17 +213,20 @@
                    :priority true))
           state)))))
 
-(defn execute-until [state until-fn]
-  (let [timeout (a/timeout 1000)
-        execution (a/go-loop [state state]
-                    (let [state (a/alt!
-                                  (gateway-lifecycle state) ([s] s)
-                                  timeout (throw (Exception. "Test timed out"))
-                                  :priority true)]
-                      (if (until-fn state)
-                        state
-                        (recur state))))]
-    (a/<!! execution)))
+(defn execute-until
+  ([state until-fn] (execute-until state until-fn (a/timeout 1000) true))
+  ([state until-fn timeout-ch throw?]
+   (let [execution (a/go-loop [state state]
+                     (let [state (a/alt!
+                                   (gateway-lifecycle state) ([s] s)
+                                   timeout-ch (when throw?
+                                                (throw (Exception. "Test timed out")))
+                                   :priority true)]
+                       (when state
+                         (if (until-fn state)
+                           state
+                           (recur state)))))]
+     (a/<!! execution))))
 
 (defn until-lifecycle [lifecycle]
   (fn [state]
@@ -264,14 +265,14 @@
 
       (testing "normal startup"
         (let [state (-> (base-state)
-                        with-reactive-websocket
+                        with-simulated-websocket
                         (execute-until #(= ::d.c.n/lifecycle.connected (::d.c.n/lifecycle %))))]
           (is (= ::d.c.n/lifecycle.connected (::d.c.n/lifecycle state))
               "Connected state is reached")))
 
       (testing "reconnect request"
         (let [state     (-> (base-state)
-                            (with-reactive-websocket (adelay ws-reconnect-response 100))
+                            (with-simulated-websocket (adelay ws-reconnect-response 100))
                             (execute-until (-> (until-lifecycle ::d.c.n/lifecycle.connected)
                                                (times 2))))
               websocket (::d.c.n/websocket state)]
@@ -282,7 +283,7 @@
 
       (testing "invalid session"
         (let [state     (-> (base-state)
-                            (with-reactive-websocket (adelay ws-invalid-session-response 100))
+                            (with-simulated-websocket (adelay ws-invalid-session-response 100))
                             (execute-until (-> (until-lifecycle ::d.c.n/lifecycle.connected)
                                                (times 2))))
               websocket (::d.c.n/websocket state)]
@@ -291,21 +292,15 @@
           (is (received? websocket ws/send-msg [:resume])
               "A request to resume the previous session is sent")))
 
-      ;(testing "multiple session event dispatch"
-      ;
-      ;  (let [dispatches (deliver-interval
-      ;                     10 (repeat 10 ws-dispatch-response))
-      ;        controls   (adelay 50
-      ;                           ws-reconnect-response
-      ;                           ws-hello-response
-      ;                           ws-ready-response)]
-      ;    (let [{::d.c.n/keys [output-ch]
-      ;           :as          state} (-> (base-state ::d.c.n/lifecycle.connected)
-      ;
-      ;                                   (n-executions 3))]
-      ;      (is (nil? state))
-      ;      (is (= 10
-      ;             (->> output-ch (a/take 10) (a/into []) a/<!!))))))
+      (testing "multiple session event dispatch"
+        (let [dispatches (deliver-interval 50 (repeat 10 ws-dispatch-response))
+              reconnect  (adelay ws-reconnect-response 100)
+              {::d.c.n/keys [output-ch]
+               :as          state} (-> (base-state)
+                                       (with-simulated-websocket (a/merge [reconnect dispatches])))]
+          (execute-until state (constantly false) (a/timeout 1000) false)
+          (is (= 10
+                 (->> output-ch (a/take 10) (a/into []) a/<!! count)))))
       )))
 
 (deftest HeartbeatRoutine
