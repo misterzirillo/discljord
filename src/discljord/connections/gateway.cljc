@@ -1,4 +1,4 @@
-(ns discljord.connections.next
+(ns discljord.connections.gateway
   (:require
     [discljord.connections.websocket :as d.c.ws]
     [discljord.util.async :refer [with-halt]]
